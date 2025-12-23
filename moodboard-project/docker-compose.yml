@@ -1,0 +1,195 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: moodboard_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: moodboard
+      POSTGRES_USER: moodboard_user
+      POSTGRES_PASSWORD: xQ8bN3vC7zM5hJ4kP6tR
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - moodboard-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moodboard_user -d moodboard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: moodboard_redis
+    restart: always
+    command: redis-server --appendonly yes --requirepass redispass123 --timeout 300 --tcp-keepalive 60
+    volumes:
+      - redis_data:/data
+    networks:
+      - moodboard-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redispass123", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: moodboard_api
+    restart: always
+    command: >
+      sh -c "
+      echo 'Ожидание базы данных...' &&
+      sleep 15 &&
+      echo 'Запуск API...' &&
+      cd /app/src && python -m uvicorn main:app --host 0.0.0.0 --port 8000
+      "
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      DATABASE_URL: postgresql://moodboard_user:xQ8bN3vC7zM5hJ4kP6tR@postgres:5432/moodboard
+      SECRET_KEY: b5f2e8a1c9d3e7f4b6a2c8d0e1f3a5b7c9d2e4
+      WEB_URL: http://5.129.215.111:8501
+      REDIS_URL: redis://:redispass123@redis:6379
+      UPLOADS_DIR: /app/uploads
+      LOG_DIR: /app/logs
+      ALLOWED_FILE_TYPES: image,text
+      MAX_UPLOAD_SIZE: "10485760"  # 10MB
+      ENABLE_SQL_INJECTION_PROTECTION: "true"
+      ENABLE_INPUT_VALIDATION: "true"
+      BLOCK_SUSPICIOUS_REQUESTS: "true"
+      MAX_QUERY_LENGTH: "10000"
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "1440"
+      JWT_ISSUER: moodboard-api
+      JWT_AUDIENCE: moodboard-users
+      LOG_LEVEL: INFO
+      SECURITY_LOG_LEVEL: WARNING
+      LOG_SQL_QUERIES: "false"
+      CORS_ORIGINS: "http://5.129.215.111:8501,http://localhost:8501"
+      CORS_ALLOW_CREDENTIALS: "true"
+      API_VERSION: v4
+      API_PREFIX: /api
+      DOCS_URL: /docs
+      REDOC_URL: /redoc
+      DATABASE_POOL_SIZE: "20"
+      DATABASE_MAX_OVERFLOW: "10"
+      DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./api:/app
+      - logs_volume:/app/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - moodboard-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: moodboard_bot
+    restart: always
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: 8510568874:AAE6SzEheVnaHpaoSyvURy3-4C0tblP17do
+      API_URL: http://api:8000
+      WEB_URL: http://5.129.215.111:8501
+      DOCKER_ENV: "true"
+      ENABLE_SQL_INJECTION_PROTECTION: "true"
+      MAX_RETRIES: "3"
+      TIMEOUT: "30"
+      DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./bot:/app
+      - ./uploads:/app/uploads
+    networks:
+      - moodboard-network
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import requests; r = requests.get('http://api:8000/health', timeout=5); exit(0 if r.status_code == 200 else 1)\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: moodboard_web
+    restart: always
+    depends_on:
+      - api
+    environment:
+      API_URL: http://api:8000
+      PUBLIC_URL: http://5.129.215.111:8501
+      ENABLE_HTTPS_REDIRECT: "false"
+      DEBUG: "true"
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "8501:8501"
+    networks:
+      - moodboard-network
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      test: [ "CMD", "python", "-c", "import requests; r = requests.get('http://localhost:8501', timeout=5); exit(0 if r.status_code == 200 else 1)" ]
+      timeout: 10s
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: moodboard_worker
+    restart: always
+    command: python worker.py
+    depends_on:
+      - redis
+      - api
+    environment:
+      REDIS_URL: redis://:redispass123@redis:6379
+      RQ_REDIS_URL: redis://:redispass123@redis:6379
+      API_URL: http://api:8000
+      WORKER_CONCURRENCY: "4"
+      QUEUE_NAME: "default"
+      MAX_RETRIES: "3"
+      DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./worker:/app
+      - ./uploads:/app/uploads
+    networks:
+      - moodboard-network
+
+volumes:
+  postgres_data:
+    driver: local
+    name: moodboard_postgres_data
+  redis_data:
+    driver: local
+    name: moodboard_redis_data
+  logs_volume:
+    driver: local
+    name: moodboard_logs
+
+networks:
+  moodboard-network:
+    driver: bridge
+    name: moodboard_network
